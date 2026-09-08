@@ -97,6 +97,7 @@ jobs:
       - name: Self-check
         if: github.event.inputs.mode == 'smoke'
         run: |
+          set -o pipefail
           pip install -r requirements-dev.txt
           python -m pytest -q 2>&1 | tail -2
           python -c "import app.cli, app.config; print('imports OK')"
