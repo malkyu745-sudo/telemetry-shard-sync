@@ -1,0 +1,34 @@
+name: keepalive-space
+
+# Free Hugging Face CPU Spaces pause after 48h without traffic. This pings the
+# Space twice a day. Set the repository secret SPACE_URL to
+# https://<your-user>-<your-space>.hf.space  (otherwise the job no-ops).
+
+on:
+  schedule:
+    - cron: "7 4,16 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping /health
+        env:
+          SPACE_URL: ${{ secrets.SPACE_URL }}
+        run: |
+          if [ -z "$SPACE_URL" ]; then
+            echo "SPACE_URL secret not set - nothing to do"
+            exit 0
+          fi
+          code=$(curl -s -o /tmp/out -w '%{http_code}' --max-time 120 "$SPACE_URL/health" || true)
+          echo "health -> HTTP $code"
+          head -c 300 /tmp/out || true
+          # A sleeping Space answers slowly / redirects; any HTTP code counts as traffic.
+          if [ "$code" = "000" ]; then
+            echo "::warning::no response from $SPACE_URL"
+            exit 1
+          fi

