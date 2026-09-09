@@ -101,6 +101,10 @@ jobs:
           pip install -r requirements-dev.txt
           python -m pytest -q 2>&1 | tail -2
           python -c "import app.cli, app.config; print('imports OK')"
+          # live credential check: one cheap rate-limit call per token proves
+          # the Authorization headers are well-formed (the 2026-09-09
+          # newline-poisoned pool died exactly here - catch it in 30s, not 3h)
+          python -m app.cli doctor 2>&1 | tail -15
           echo "SELF_CHECK_OK"
 
       # Dispatch inputs are untrusted: routed through env, allow-listed, never
